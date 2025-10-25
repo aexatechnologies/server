@@ -4,6 +4,7 @@ import tempfile
 import threading
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
+import mimetypes
 
 app = Flask(__name__)
 
@@ -39,13 +40,18 @@ def download_video():
     ydl_opts = {
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
         "quiet": True,
-        "format": "bestvideo+bestaudio/best",
+        # Download best video + audio and merge as mp4
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+        "merge_output_format": "mp4",  # ensures final file is mp4
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(url, download=True)
             downloaded_file = ydl.prepare_filename(info_dict)
+            # Ensure file ends with .mp4
+            if not downloaded_file.endswith(".mp4"):
+                downloaded_file = os.path.splitext(downloaded_file)[0] + ".mp4"
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(e)}), 500
@@ -56,15 +62,15 @@ def download_video():
 
     # Schedule cleanup after sending file
     delete_file_later(downloaded_file, delay=10)
-    # Optionally remove temp folder later
     threading.Timer(15, lambda: shutil.rmtree(temp_dir, ignore_errors=True)).start()
 
-    # Send file as binary (n8n-ready)
+    # Send file with proper MIME type
+    mime_type, _ = mimetypes.guess_type(downloaded_file)
     response = send_file(
         downloaded_file,
         as_attachment=True,
         download_name=os.path.basename(downloaded_file),
-        mimetype="application/octet-stream"
+        mimetype=mime_type or "application/octet-stream"
     )
     return response
 
@@ -73,7 +79,7 @@ def download_video():
 def index():
     return jsonify({
         "message": "yt-dlp API running. POST /download with JSON {url: <video_url>}",
-        "note": "Binary-ready for n8n"
+        "note": "Binary-ready for n8n, outputs MP4 compatible with Twitter"
     })
 
 
