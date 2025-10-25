@@ -2,7 +2,7 @@ import os
 import shutil
 import tempfile
 import threading
-from flask import Flask, request, send_file, jsonify, Response
+from flask import Flask, request, send_file, jsonify
 import yt_dlp
 import mimetypes
 
@@ -11,16 +11,34 @@ app = Flask(__name__)
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
+
 def delete_file_later(path, delay=10):
-    threading.Timer(delay, lambda: os.remove(path) if os.path.exists(path) else None).start()
+    """Delete the file after `delay` seconds in a background thread"""
+    def _delete():
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"[CLEANUP] Deleted file: {path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to delete {path}: {e}")
+    threading.Timer(delay, _delete).start()
+
 
 def delete_folder_later(path, delay=15):
-    threading.Timer(delay, lambda: shutil.rmtree(path, ignore_errors=True)).start()
+    """Delete a folder after `delay` seconds"""
+    def _delete_folder():
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"[CLEANUP] Deleted folder: {path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to delete folder {path}: {e}")
+    threading.Timer(delay, _delete_folder).start()
+
 
 @app.route("/download", methods=["POST"])
 def download_video():
     data = request.get_json()
-    url = data.get("url")
+    url = data.get("url") if data else None
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
@@ -47,10 +65,12 @@ def download_video():
         shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": "Download failed"}), 500
 
+    # File metadata
     file_size = os.path.getsize(downloaded_file)
     mime_type, _ = mimetypes.guess_type(downloaded_file)
     mime_type = mime_type or "application/octet-stream"
 
+    # Schedule cleanup
     delete_file_later(downloaded_file, delay=10)
     delete_folder_later(temp_dir, delay=15)
 
@@ -64,14 +84,24 @@ def download_video():
     response.headers["X-Filename"] = os.path.basename(downloaded_file)
     response.headers["X-Size-Bytes"] = str(file_size)
     response.headers["X-Mime-Type"] = mime_type
+
+    print(f"[INFO] Sent file: {downloaded_file} ({file_size} bytes)")
     return response
+
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "message": "yt-dlp API running. POST /download with JSON {url: <video_url>}",
-        "note": "Binary file returned with metadata in HTTP headers"
+        "note": "Binary file returned with metadata in HTTP headers",
+        "headers_example": {
+            "X-Filename": "video.mp4",
+            "X-Size-Bytes": "12345678",
+            "X-Mime-Type": "video/mp4"
+        }
     })
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Enable threading so downloads don't block the entire app
+    app.run(host="0.0.0.0", port=8080, threaded=True)
