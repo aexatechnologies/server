@@ -3,10 +3,10 @@ import shutil
 import tempfile
 import threading
 import logging
-from flask import Flask, request, Response, jsonify
+import base64
+from flask import Flask, request, jsonify
 import yt_dlp
-import mimetypes
-from urllib.parse import quote
+import requests
 
 app = Flask(__name__)
 
@@ -20,6 +20,7 @@ DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB
+N8N_WEBHOOK = "https://your-n8n-server/webhook/receive-chunk"  # <-- update this
 
 
 # === Cleanup Utilities ===
@@ -61,18 +62,35 @@ def download_with_ytdlp(url: str, temp_dir: str) -> str:
     return downloaded
 
 
-# === Generator for Chunked Streaming ===
-def stream_file_in_chunks(file_path):
-    """Yield chunks of the file with their size in headers."""
-    try:
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
-    except Exception as e:
-        logging.error(f"[STREAM ERROR] {e}")
+# === Push file in chunks to n8n ===
+def push_file_to_n8n(file_path):
+    filename = os.path.basename(file_path)
+    total_size = os.path.getsize(file_path)
+    chunk_number = 0
+
+    logging.info(f"[PUSH] Sending '{filename}' to n8n in chunks...")
+
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            chunk_number += 1
+            payload = {
+                "filename": filename,
+                "chunk_number": chunk_number,
+                "chunk_size": len(chunk),
+                "total_size": total_size,
+                "data": base64.b64encode(chunk).decode("utf-8")
+            }
+            try:
+                r = requests.post(N8N_WEBHOOK, json=payload, timeout=30)
+                if r.status_code != 200:
+                    logging.warning(f"[PUSH] Chunk {chunk_number} returned status {r.status_code}")
+            except Exception as e:
+                logging.error(f"[PUSH] Failed to send chunk {chunk_number}: {e}")
+
+    logging.info(f"[PUSH] Completed sending '{filename}' ({chunk_number} chunks).")
 
 
 # === Routes ===
@@ -101,40 +119,18 @@ def download_video():
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify({"error": "File missing after download"}), 500
 
-        # === Metadata ===
-        file_size = os.path.getsize(downloaded_file)
-        mime_type, _ = mimetypes.guess_type(downloaded_file)
-        mime_type = mime_type or "application/octet-stream"
+        # Schedule cleanup
+        schedule_delete(downloaded_file, delay=60)
+        schedule_delete(temp_dir, delay=65, is_dir=True)
 
-        schedule_delete(downloaded_file, delay=30)
-        schedule_delete(temp_dir, delay=35, is_dir=True)
+        # Push file in a separate thread so we can return immediately
+        threading.Thread(target=push_file_to_n8n, args=(downloaded_file,)).start()
 
-        original_name = os.path.basename(downloaded_file)
-        try:
-            safe_filename = original_name.encode("latin-1").decode("latin-1")
-        except UnicodeEncodeError:
-            safe_filename = quote(original_name)
-
-        logging.info(f"[STREAMING] Sending file in chunks: {safe_filename}")
-
-        # === Response Streaming ===
-        def generate():
-            with open(downloaded_file, "rb") as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    # yield as bytes
-                    yield chunk
-
-        headers = {
-            "Content-Disposition": f'attachment; filename="{safe_filename}"',
-            "X-Filename": safe_filename,
-            "X-Size-Bytes": str(file_size),
-            "X-Mime-Type": mime_type,
-        }
-
-        return Response(generate(), headers=headers, mimetype=mime_type)
+        return jsonify({
+            "message": "File is being pushed to n8n in chunks",
+            "filename": os.path.basename(downloaded_file),
+            "total_size": os.path.getsize(downloaded_file)
+        })
 
     except Exception as e:
         logging.exception("[FATAL] Unhandled exception in /download")
@@ -146,13 +142,8 @@ def index():
     return jsonify({
         "message": "yt-dlp API running",
         "usage": "POST /download with JSON {url: <video_url>}",
-        "returns": "Binary MP4 streamed in chunks",
-        "chunk_size_bytes": CHUNK_SIZE,
-        "example_headers": {
-            "X-Filename": "video.mp4",
-            "X-Size-Bytes": "12345678",
-            "X-Mime-Type": "video/mp4"
-        },
+        "returns": "File is pushed to n8n webhook in 5MB chunks",
+        "n8n_webhook": N8N_WEBHOOK
     })
 
 
