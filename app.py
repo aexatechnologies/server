@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import threading
 import logging
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, Response, jsonify
 import yt_dlp
 import mimetypes
 from urllib.parse import quote
@@ -18,6 +18,8 @@ logging.basicConfig(
 
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
 # === Cleanup Utilities ===
@@ -59,11 +61,24 @@ def download_with_ytdlp(url: str, temp_dir: str) -> str:
     return downloaded
 
 
+# === Generator for Chunked Streaming ===
+def stream_file_in_chunks(file_path):
+    """Yield chunks of the file with their size in headers."""
+    try:
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+    except Exception as e:
+        logging.error(f"[STREAM ERROR] {e}")
+
+
 # === Routes ===
 @app.route("/download", methods=["POST"])
 def download_video():
     try:
-        # === Input Validation ===
         data = request.get_json(silent=True)
         url = data.get("url") if data else None
         if not url:
@@ -71,7 +86,6 @@ def download_video():
 
         logging.info(f"[REQUEST] Download requested for URL: {url}")
 
-        # === Temp workspace ===
         temp_dir = tempfile.mkdtemp(dir=DOWNLOAD_FOLDER)
 
         try:
@@ -92,33 +106,35 @@ def download_video():
         mime_type, _ = mimetypes.guess_type(downloaded_file)
         mime_type = mime_type or "application/octet-stream"
 
-        # === Cleanup scheduling ===
-        schedule_delete(downloaded_file, delay=15)
-        schedule_delete(temp_dir, delay=20, is_dir=True)
+        schedule_delete(downloaded_file, delay=30)
+        schedule_delete(temp_dir, delay=35, is_dir=True)
 
-        # === Sanitize filename for headers ===
         original_name = os.path.basename(downloaded_file)
         try:
             safe_filename = original_name.encode("latin-1").decode("latin-1")
         except UnicodeEncodeError:
             safe_filename = quote(original_name)
 
-        # === Build response ===
-        response = send_file(
-            downloaded_file,
-            as_attachment=True,
-            download_name=original_name,
-            mimetype=mime_type,
-            conditional=True,  # Supports range requests
-            max_age=0,
-        )
+        logging.info(f"[STREAMING] Sending file in chunks: {safe_filename}")
 
-        response.headers["X-Filename"] = safe_filename
-        response.headers["X-Size-Bytes"] = str(file_size)
-        response.headers["X-Mime-Type"] = mime_type
+        # === Response Streaming ===
+        def generate():
+            with open(downloaded_file, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    # yield as bytes
+                    yield chunk
 
-        logging.info(f"[SUCCESS] Sent file: {safe_filename} ({file_size} bytes)")
-        return response
+        headers = {
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "X-Filename": safe_filename,
+            "X-Size-Bytes": str(file_size),
+            "X-Mime-Type": mime_type,
+        }
+
+        return Response(generate(), headers=headers, mimetype=mime_type)
 
     except Exception as e:
         logging.exception("[FATAL] Unhandled exception in /download")
@@ -130,7 +146,8 @@ def index():
     return jsonify({
         "message": "yt-dlp API running",
         "usage": "POST /download with JSON {url: <video_url>}",
-        "returns": "Binary MP4 + metadata in HTTP headers",
+        "returns": "Binary MP4 streamed in chunks",
+        "chunk_size_bytes": CHUNK_SIZE,
         "example_headers": {
             "X-Filename": "video.mp4",
             "X-Size-Bytes": "12345678",
