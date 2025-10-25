@@ -3,10 +3,10 @@ import shutil
 import tempfile
 import threading
 import logging
-import base64
-from flask import Flask, request, jsonify
+from flask import Flask, request, send_file, jsonify
 import yt_dlp
-import requests
+import mimetypes
+from urllib.parse import quote
 
 app = Flask(__name__)
 
@@ -18,9 +18,6 @@ logging.basicConfig(
 
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-
-CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB
-N8N_WEBHOOK = "https://your-n8n-server/webhook/receive-chunk"  # <-- update this
 
 
 # === Cleanup Utilities ===
@@ -62,41 +59,11 @@ def download_with_ytdlp(url: str, temp_dir: str) -> str:
     return downloaded
 
 
-# === Push file in chunks to n8n ===
-def push_file_to_n8n(file_path):
-    filename = os.path.basename(file_path)
-    total_size = os.path.getsize(file_path)
-    chunk_number = 0
-
-    logging.info(f"[PUSH] Sending '{filename}' to n8n in chunks...")
-
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            chunk_number += 1
-            payload = {
-                "filename": filename,
-                "chunk_number": chunk_number,
-                "chunk_size": len(chunk),
-                "total_size": total_size,
-                "data": base64.b64encode(chunk).decode("utf-8")
-            }
-            try:
-                r = requests.post(N8N_WEBHOOK, json=payload, timeout=30)
-                if r.status_code != 200:
-                    logging.warning(f"[PUSH] Chunk {chunk_number} returned status {r.status_code}")
-            except Exception as e:
-                logging.error(f"[PUSH] Failed to send chunk {chunk_number}: {e}")
-
-    logging.info(f"[PUSH] Completed sending '{filename}' ({chunk_number} chunks).")
-
-
 # === Routes ===
 @app.route("/download", methods=["POST"])
 def download_video():
     try:
+        # === Input Validation ===
         data = request.get_json(silent=True)
         url = data.get("url") if data else None
         if not url:
@@ -104,6 +71,7 @@ def download_video():
 
         logging.info(f"[REQUEST] Download requested for URL: {url}")
 
+        # === Temp workspace ===
         temp_dir = tempfile.mkdtemp(dir=DOWNLOAD_FOLDER)
 
         try:
@@ -119,18 +87,38 @@ def download_video():
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify({"error": "File missing after download"}), 500
 
-        # Schedule cleanup
-        schedule_delete(downloaded_file, delay=60)
-        schedule_delete(temp_dir, delay=65, is_dir=True)
+        # === Metadata ===
+        file_size = os.path.getsize(downloaded_file)
+        mime_type, _ = mimetypes.guess_type(downloaded_file)
+        mime_type = mime_type or "application/octet-stream"
 
-        # Push file in a separate thread so we can return immediately
-        threading.Thread(target=push_file_to_n8n, args=(downloaded_file,)).start()
+        # === Cleanup scheduling ===
+        schedule_delete(downloaded_file, delay=15)
+        schedule_delete(temp_dir, delay=20, is_dir=True)
 
-        return jsonify({
-            "message": "File is being pushed to n8n in chunks",
-            "filename": os.path.basename(downloaded_file),
-            "total_size": os.path.getsize(downloaded_file)
-        })
+        # === Sanitize filename for headers ===
+        original_name = os.path.basename(downloaded_file)
+        try:
+            safe_filename = original_name.encode("latin-1").decode("latin-1")
+        except UnicodeEncodeError:
+            safe_filename = quote(original_name)
+
+        # === Build response ===
+        response = send_file(
+            downloaded_file,
+            as_attachment=True,
+            download_name=original_name,
+            mimetype=mime_type,
+            conditional=True,  # Supports range requests
+            max_age=0,
+        )
+
+        response.headers["X-Filename"] = safe_filename
+        response.headers["X-Size-Bytes"] = str(file_size)
+        response.headers["X-Mime-Type"] = mime_type
+
+        logging.info(f"[SUCCESS] Sent file: {safe_filename} ({file_size} bytes)")
+        return response
 
     except Exception as e:
         logging.exception("[FATAL] Unhandled exception in /download")
@@ -142,8 +130,12 @@ def index():
     return jsonify({
         "message": "yt-dlp API running",
         "usage": "POST /download with JSON {url: <video_url>}",
-        "returns": "File is pushed to n8n webhook in 5MB chunks",
-        "n8n_webhook": N8N_WEBHOOK
+        "returns": "Binary MP4 + metadata in HTTP headers",
+        "example_headers": {
+            "X-Filename": "video.mp4",
+            "X-Size-Bytes": "12345678",
+            "X-Mime-Type": "video/mp4"
+        },
     })
 
 
