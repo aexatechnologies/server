@@ -2,106 +2,143 @@ import os
 import shutil
 import tempfile
 import threading
+import logging
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
 import mimetypes
+from urllib.parse import quote
 
 app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+)
 
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 
-def delete_file_later(path, delay=10):
-    """Delete the file after `delay` seconds in a background thread"""
+# === Cleanup Utilities ===
+def schedule_delete(path, delay=10, is_dir=False):
+    """Delete a file or folder after a delay."""
     def _delete():
         try:
-            if os.path.exists(path):
+            if is_dir:
+                shutil.rmtree(path, ignore_errors=True)
+                logging.info(f"[CLEANUP] Folder deleted: {path}")
+            elif os.path.exists(path):
                 os.remove(path)
-                print(f"[CLEANUP] Deleted file: {path}")
+                logging.info(f"[CLEANUP] File deleted: {path}")
         except Exception as e:
-            print(f"[ERROR] Failed to delete {path}: {e}")
+            logging.error(f"[CLEANUP ERROR] Could not delete {path}: {e}")
+
     threading.Timer(delay, _delete).start()
 
 
-def delete_folder_later(path, delay=15):
-    """Delete a folder after `delay` seconds"""
-    def _delete_folder():
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-            print(f"[CLEANUP] Deleted folder: {path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to delete folder {path}: {e}")
-    threading.Timer(delay, _delete_folder).start()
-
-
-@app.route("/download", methods=["POST"])
-def download_video():
-    data = request.get_json()
-    url = data.get("url") if data else None
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    temp_dir = tempfile.mkdtemp(dir=DOWNLOAD_FOLDER)
-
+# === Core Download Logic ===
+def download_with_ytdlp(url: str, temp_dir: str) -> str:
+    """Download a video using yt_dlp and return the local file path."""
     ydl_opts = {
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
         "merge_output_format": "mp4",
+        "retries": 3,
+        "socket_timeout": 30,
+        "noprogress": True,
     }
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info_dict = ydl.extract_info(url, download=True)
+        downloaded = ydl.prepare_filename(info_dict)
+        if not downloaded.endswith(".mp4"):
+            downloaded = os.path.splitext(downloaded)[0] + ".mp4"
+
+    return downloaded
+
+
+# === Routes ===
+@app.route("/download", methods=["POST"])
+def download_video():
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            downloaded_file = ydl.prepare_filename(info_dict)
-            if not downloaded_file.endswith(".mp4"):
-                downloaded_file = os.path.splitext(downloaded_file)[0] + ".mp4"
+        # === Input Validation ===
+        data = request.get_json(silent=True)
+        url = data.get("url") if data else None
+        if not url:
+            return jsonify({"error": "Missing field 'url' in JSON"}), 400
+
+        logging.info(f"[REQUEST] Download requested for URL: {url}")
+
+        # === Temp workspace ===
+        temp_dir = tempfile.mkdtemp(dir=DOWNLOAD_FOLDER)
+
+        try:
+            downloaded_file = download_with_ytdlp(url, temp_dir)
+        except yt_dlp.utils.DownloadError as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": f"DownloadError: {str(e)}"}), 500
+        except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+        if not os.path.exists(downloaded_file):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": "File missing after download"}), 500
+
+        # === Metadata ===
+        file_size = os.path.getsize(downloaded_file)
+        mime_type, _ = mimetypes.guess_type(downloaded_file)
+        mime_type = mime_type or "application/octet-stream"
+
+        # === Cleanup scheduling ===
+        schedule_delete(downloaded_file, delay=15)
+        schedule_delete(temp_dir, delay=20, is_dir=True)
+
+        # === Sanitize filename for headers ===
+        original_name = os.path.basename(downloaded_file)
+        try:
+            safe_filename = original_name.encode("latin-1").decode("latin-1")
+        except UnicodeEncodeError:
+            safe_filename = quote(original_name)
+
+        # === Build response ===
+        response = send_file(
+            downloaded_file,
+            as_attachment=True,
+            download_name=original_name,
+            mimetype=mime_type,
+            conditional=True,  # Supports range requests
+            max_age=0,
+        )
+
+        response.headers["X-Filename"] = safe_filename
+        response.headers["X-Size-Bytes"] = str(file_size)
+        response.headers["X-Mime-Type"] = mime_type
+
+        logging.info(f"[SUCCESS] Sent file: {safe_filename} ({file_size} bytes)")
+        return response
+
     except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        logging.exception("[FATAL] Unhandled exception in /download")
         return jsonify({"error": str(e)}), 500
-
-    if not os.path.exists(downloaded_file):
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return jsonify({"error": "Download failed"}), 500
-
-    # File metadata
-    file_size = os.path.getsize(downloaded_file)
-    mime_type, _ = mimetypes.guess_type(downloaded_file)
-    mime_type = mime_type or "application/octet-stream"
-
-    # Schedule cleanup
-    delete_file_later(downloaded_file, delay=10)
-    delete_folder_later(temp_dir, delay=15)
-
-    # Send file with metadata in headers
-    response = send_file(
-        downloaded_file,
-        as_attachment=True,
-        download_name=os.path.basename(downloaded_file),
-        mimetype=mime_type
-    )
-    response.headers["X-Filename"] = os.path.basename(downloaded_file)
-    response.headers["X-Size-Bytes"] = str(file_size)
-    response.headers["X-Mime-Type"] = mime_type
-
-    print(f"[INFO] Sent file: {downloaded_file} ({file_size} bytes)")
-    return response
 
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "message": "yt-dlp API running. POST /download with JSON {url: <video_url>}",
-        "note": "Binary file returned with metadata in HTTP headers",
-        "headers_example": {
+        "message": "yt-dlp API running",
+        "usage": "POST /download with JSON {url: <video_url>}",
+        "returns": "Binary MP4 + metadata in HTTP headers",
+        "example_headers": {
             "X-Filename": "video.mp4",
             "X-Size-Bytes": "12345678",
             "X-Mime-Type": "video/mp4"
-        }
+        },
     })
 
 
+# === App Entrypoint ===
 if __name__ == "__main__":
-    # Enable threading so downloads don't block the entire app
     app.run(host="0.0.0.0", port=8080, threaded=True)
