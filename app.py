@@ -39,24 +39,48 @@ def schedule_delete(path, delay=10, is_dir=False):
 
 # === Core Download Logic ===
 def download_with_ytdlp(url: str, temp_dir: str) -> str:
-    """Download a video using yt_dlp and return the local file path."""
+    """Download the highest-quality video using yt_dlp and return the local file path."""
     ydl_opts = {
+        # Template for output filename
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-        "quiet": True,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+
+        # Download best available video and audio (any format)
+        # Fallback to best combined if separate streams unavailable
+        "format": "bestvideo+bestaudio/best",
+
+        # Merge into a single MP4 container using ffmpeg
         "merge_output_format": "mp4",
+
+        # Other options
+        "quiet": True,
         "retries": 3,
         "socket_timeout": 30,
         "noprogress": True,
+        "ignoreerrors": False,
+
+        # Clean metadata (optional)
+        "postprocessors": [
+            {"key": "FFmpegMetadata"},
+        ],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=True)
         downloaded = ydl.prepare_filename(info_dict)
+
+        # Force .mp4 extension if merged output isn't .mp4
         if not downloaded.endswith(".mp4"):
             downloaded = os.path.splitext(downloaded)[0] + ".mp4"
 
+        # Log format info for visibility
+        height = info_dict.get("height")
+        fps = info_dict.get("fps")
+        fmt_note = info_dict.get("format_note")
+        ext = info_dict.get("ext")
+        logging.info(f"[YTDLP] Downloaded format: {fmt_note or height}p @ {fps or '?'}fps ({ext})")
+
     return downloaded
+
 
 
 # === Routes ===
