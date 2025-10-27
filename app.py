@@ -151,16 +151,85 @@ def download_video():
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({
-        "message": "yt-dlp API running",
-        "usage": "POST /download with JSON {url: <video_url>}",
-        "returns": "Binary MP4 + metadata in HTTP headers",
-        "example_headers": {
-            "X-Filename": "video.mp4",
-            "X-Size-Bytes": "12345678",
-            "X-Mime-Type": "video/mp4"
-        },
-    })
+    return """
+    <html>
+    <head>
+        <title>yt-dlp API</title>
+        <style>
+            body {
+                font-family: "Segoe UI", Roboto, sans-serif;
+                background: linear-gradient(135deg, #1f2937, #111827);
+                color: #f9fafb;
+                margin: 0;
+                padding: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+            }
+            .container {
+                background-color: rgba(31, 41, 55, 0.9);
+                padding: 40px;
+                border-radius: 16px;
+                max-width: 700px;
+                box-shadow: 0 4px 30px rgba(0, 0, 0, 0.4);
+            }
+            h1 {
+                color: #60a5fa;
+                font-size: 2.2em;
+                margin-bottom: 0.3em;
+            }
+            p {
+                color: #d1d5db;
+                line-height: 1.5em;
+                font-size: 1.05em;
+            }
+            code {
+                background-color: #374151;
+                color: #facc15;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-family: "Courier New", monospace;
+            }
+            pre {
+                background-color: #1e293b;
+                padding: 10px;
+                border-radius: 8px;
+                overflow-x: auto;
+                font-size: 0.9em;
+                color: #f8fafc;
+            }
+            .footer {
+                margin-top: 20px;
+                font-size: 0.85em;
+                color: #9ca3af;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>yt-dlp API Server</h1>
+            <p>This server lets you download videos using <code>yt-dlp</code> and returns a ready-to-use MP4 file.</p>
+
+            <h2>📦 Usage</h2>
+            <p>Send a <code>POST</code> request to <code>/download</code> with JSON:</p>
+            <pre>{
+    "url": "https://www.youtube.com/watch?v=EXAMPLE"
+}</pre>
+
+            <h2>📥 Response</h2>
+            <p>The server responds with the binary MP4 file. Example headers:</p>
+            <pre>{
+    "X-Filename": "video.mp4",
+    "X-Size-Bytes": "12345678",
+    "X-Mime-Type": "video/mp4"
+}</pre>
+
+            <div class="footer">Built with ❤️ Flask + yt-dlp</div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 # === App Entrypoint ===
